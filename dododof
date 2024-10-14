@@ -1,0 +1,857 @@
+local pui = require "gamesense/pui"
+local http = require "gamesense/http"
+local adata = require "gamesense/antiaim_funcs"
+local vector = require "vector"
+local msgpack = require "gamesense/msgpack"
+local weapondata = require "gamesense/csgo_weapons"
+local entity = require "gamesense/entity"
+
+local C = function (t) local c = {} if type(t) ~= "table" then return t end for k, v in next, t do c[k] = v end return c end
+
+local table, math, string = C(table), C(math), C(string)
+local ui, client, database, entity, ffi, globals, panorama, renderer
+= C(ui), C(client), C(database), C(entity), C(require "ffi"), C(globals), C(panorama), C(renderer)
+
+local callbacks do
+	local event_mt = {
+		__call = function (self, bool, fn)
+			local action = bool and client.set_event_callback or client.unset_event_callback
+			action(self[1], fn)
+		end,
+		set = function (self, fn)
+			client.set_event_callback(self[1], fn)
+            return {
+                unset = function()
+                    client.unset_event_callback(self[1], fn)
+                end
+            }
+		end,
+        setFor = function (self, fn, dly)
+			client.set_event_callback(self[1], fn)
+            client.delay_call(dly, function() client.unset_event_callback(self[1], fn) end)
+		end,
+        once = function (self, fn)
+            local fnc
+            fnc = function(...) fn(...) client.unset_event_callback(self[1], fnc) end
+			client.set_event_callback(self[1], fnc)
+		end,
+		unset = function (self, fn)
+			client.unset_event_callback(self[1], fn)
+		end,
+		fire = function (self, ...)
+			client.fire_event(self[1], ...)
+		end,
+	}	event_mt.__index = event_mt
+
+	callbacks = setmetatable({}, {
+		__index = function (self, key)
+			self[key] = setmetatable({key}, event_mt)
+			return self[key]
+		end,
+	})
+end
+
+local events
+do
+    events = setmetatable({
+        events = {},
+        new = function(eventName, eventFunc)
+            events.events[eventName] = eventFunc
+        end,
+    }, {
+        __index = function(self, name)
+            return {
+                fire = function(self, ...)
+                    events.events[name](...)
+                end
+            }
+        end
+    })
+end
+
+local inertia = {
+    name = "?",
+    uid = -1
+}
+
+events.new("auth", function(auth)
+    if string.match(auth.code:lower(), "accepted") then
+        inertia.name = auth.name
+        inertia.uid = auth.uid
+    end
+end)
+
+
+events.auth:fire({code = "accepted", uid = 3, name = "dev"})
+
+table.clear = require "table.clear"
+table.ifind = function (t, j)  for i = 1, #t do if t[i] == j then return i end end  end
+table.append = function (t, ...)  for i, v in ipairs{...} do table.insert(t, v) end  end
+table.mfind = function (t, j)  for i = 1, table.maxn(t) do if t[i] == j then return i end end  end
+table.find = function (t, j)  for k, v in pairs(t) do if v == j then return k end end return false  end
+table.filter = function (t)  local res = {} for i = 1, table.maxn(t) do if t[i] ~= nil then res[#res+1] = t[i] end end return res  end
+table.copy = function (o) if type(o) ~= "table" then return o end local res = {} for k, v in pairs(o) do res[table.copy(k)] = table.copy(v) end return res end
+table.ihas = function (t, ...) local arg = {...} for i = 1, table.maxn(t) do for j = 1, #arg do if t[i] == arg[j] then return true end end end return false end
+table.distribute = function (t, r, k)  local result = {} for i, v in ipairs(t) do local n = k and v[k] or i result[n] = r == nil and i or v[r] end return result  end
+table.place = function (t, path, place)  local p = t for i, v in ipairs(path) do if type(p[v]) == "table" then p = p[v] else p[v] = (i < #path) and {} or place  p = p[v]  end end return t  end
+
+math.e = 2.71828
+math.gratio = 1.6180339887
+math.randomseed( client.timestamp() - 143 )
+math.round = function (v)  return math.floor(v + 0.5)  end
+math.roundb = function (v, d)  return math.floor(v + 0.5) / (d or 0) ^ 1  end
+math.clamp = function (x, a, b) if a > x then return a elseif b < x then return b else return x end end
+math.lerp = function (a, b, w)  return a + (b - a) * w  end
+math.normalize_yaw = function (yaw) return (yaw + 180) % -360 + 180 end
+math.normalize_pitch = function (pitch) return math.clamp(pitch, -89, 89) end
+math.closest_ray_point = function (p, s, e)
+	local t, d = p - s, e - s
+	local l = d:length()
+	d = d / l
+	local r = d:dot(t)
+	if r < 0 then return s elseif r > l then return e end
+	return s + d * r
+end
+
+callbacks.paint:set(function()
+    local size_x, size_y = client.screen_size()
+    local text = string.format("inertia.lua - %s ms - %s - %s", tostring(math.floor(client.real_latency() * 1000)), inertia.name, tostring(inertia.uid))
+    renderer.text(size_x / 2, 4, 255, 255, 255, 255, "c", 0, text)
+    renderer.blur(size_x / 2 - renderer.measure_text("c", text) / 2, 0, renderer.measure_text("c", text), 5, 255, 42)
+end)
+
+function RGBToHex(rgb)
+    local hex = ""
+    for i = 1 , #rgb do
+        local hex_table = {"0","1","2","3","4","5","6","7","8","9","A","B","C","D","E","F"}
+        local num =  rgb[i]/16 
+        local whole = math.floor( num )
+        local remainder = num - whole
+        hex = hex .. hex_table[whole+1] .. hex_table[remainder*16 + 1]
+    end
+    return hex
+end
+
+function ColorShift(text, base, increase, rate)
+    local color_base = base
+    for i,v in next, color_base do
+        color_base[i] = v - (increase[i] or 0)
+    end
+    local cur, rate = -1, (rate or 1)
+    return string.gsub(text,"",function(char)
+        cur = cur + 1
+        if rate ~= 1 then
+            if (cur % rate) == 0 then
+                for i,v in next, color_base do
+                    color_base[i] = v + (increase[i] or 0)
+                end
+                return string.format("\a%sFF%s",RGBToHex(color_base),char)
+            else
+                return string.format("%s",char)
+            end
+        else
+            for i,v in next, color_base do
+                color_base[i] = v + (increase[i] or 0)
+            end
+            return string.format("\a%sFF%s",RGBToHex(color_base),char)
+        end
+        return text
+    end)
+end
+
+
+local function color(r, g, b, a)
+    local color = {}
+    color.r, color.g, color.b, color.a = r, g, b, a or 255
+    function color:convert()
+        return color.r, color.g, color.b, color.a
+    end
+    function color:lerp(new, t)
+        assert(new, "missing value #1")
+        assert(t, "missing timing #2")
+        self.r = math.lerp(self.r, new.r, t)
+        self.g = math.lerp(self.g, new.g, t)
+        self.b = math.lerp(self.b, new.b, t)
+        self.a = math.lerp(self.a, new.a, t)
+        return self
+    end
+    return color
+end
+
+local function is_wall_visible(player, pos)
+    local campos = vector(client.camera_position())
+    local trace, damage = client.trace_bullet(entity.get_local_player(), campos.x, campos.y, campos.z, pos.x, pos.y, pos.z, false)
+    --print(trace, damage)
+    return trace ~= nil --and not entity.is_occluded(player, pos.x, pos.y, pos.z)
+end
+
+local function is_wall_visible_from(campos, pos)
+    local trace, damage = client.trace_bullet(entity.get_local_player(), campos.x, campos.y, campos.z, pos.x, pos.y, pos.z, false)
+    return trace ~= nil
+end
+
+
+local function isVisibleAnyBone(eye, pos)
+    local visibleBone, visible = nil, false
+    local bone = pos
+    if bone ~= nil and is_wall_visible_from(eye, pos) then
+        visible = true
+        visibleBone = bone
+    end
+    return visibleBone, visible
+end
+
+
+do 
+    inertia.dot = '\v•  \r'
+    inertia.menu = {}
+    local main_group = pui.group("LUA", "A")
+    inertia.menu.ragebot = {}
+    do
+        -- Gamesense UI API to help me
+        -- ui.new_slider(tab: string, container: string, name: string, min: number, max: number, init_value: number, show_tooltip: boolean, unit: string, scale: number, tooltips: table): number
+        local text = ColorShift("inertia.lua | main", {85, 26, 139}, {6, 6, 6}, 4)
+        -- ui.new_combobox(tab: string, container: string, name: string, ...): number
+        local inertia_hop_symbols = {"↗→↘↔"}
+        local local_player_flags = {}
+        local renderhelper = {}
+        
+        inertia.menu.ragebot.title = ui.new_label("LUA", "A", "               ".. text)
+        -- ui.new_hotkey(tab: string, container: string, name: string, inline: boolean, default_hotkey: number): number
+        inertia.menu.ragebot.ragebot_title = ui.new_label("LUA", "A", '\a'.. RGBToHex({85, 26, 159}).. 'ff\v•  \r'.. ColorShift("Ragebot", {95, 36, 159}, {19, 19, 19}, 2))
+        inertia.menu.ragebot.antiaim_title = ui.new_label("LUA", "A", '\a'.. RGBToHex({85, 26, 159}).. 'ff\v•  \r'.. ColorShift("Antiaim", {95, 36, 159}, {22, 22, 22}, 3))do
+            inertia.menu.ragebot.antiaim = {
+                title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Antiaim Enabled", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+                splitterdefensive = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------"),
+                defensive = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Defensive", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "On Land", "Air", "Air Jitter", "Desync"),
+                fakewalk = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Fakewalk", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+                onshot = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("On Shot", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+                nasawalk = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Desync", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+                nasawalkbind = ui.new_hotkey("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Nasawalk", {111, 45, 170}, {9, 9, 9}, 5), true, 0),
+                -- #region Pitch
+                splitterpitch = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------"),
+                pitchmode = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Pitch", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Down", "Fake Down", "Random", "Emotion"),
+                pitch_offset = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Pitch Offset", {111, 45, 170}, {9, 9, 9}, 5), -180, 180, 0, true, "°", 1, {}),
+                pitch_jitter = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Pitch Jitter", {111, 45, 170}, {9, 9, 9}, 5), -180, 180, 0, true, "°", 1, {}),
+                splitterpitchend = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------"),
+                -- #endregion Pitch
+                -- #region Yaw
+                yawmode = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Yaw", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Static", "Jitter", "Delayed", "Desync"),
+                yaw_offset = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Yaw Offset", {111, 45, 170}, {9, 9, 9}, 5), -180, 180, 0, true, "°", 1, {}),
+                yaw_jitter = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Yaw Jitter", {111, 45, 170}, {9, 9, 9}, 5), -180, 180, 0, true, "°", 1, {}),
+                splitteryawend = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------"),
+                -- #endregion Yaw
+                -- #region Extra
+                lowerbodyyaw = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Lower Body Yaw", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Ideal", "Always Zero", "Breaker", "Follow", "Exploit"),
+            }
+            local antiaim_event
+            local last = globals.tickcount()
+            local timer = 0
+            local jitter = 5
+            local yawOffset = 0
+            local yawori = 1
+            local random_drop = 25
+            local tickbase = 0
+            local defensive_timer = 0
+            local draw = 0
+            local inverter, inverterticks = 90, 10
+            local tickSync, grenadeFix = 0, 0
+            local override = 0
+            local hookedAngles = {}
+            local gay = 0
+            local draw2, draw2i = 0, 0
+            local lby_timer = globals.curtime()
+            --[[callbacks.bullet_impact:set(function(event)
+                --print(event.userid, client_userid_to_entindex(event.userid), entity_get_local_player())
+                if event.userid == entity.get_local_player() then
+                    return
+                end
+                local sine, bval, d, as = 0, 25, .7, 5
+                --print("continue")
+                callbacks.override_view:setFor(function(event) 
+                    sine = sine + 2
+                    bval = bval + 1
+                    d = d * .997
+                    as = as * .9
+                    event.pitch = math.lerp(event.pitch, event.pitch + (math.cos(sine / 5) * as), d) 
+                end, 2)
+            end)]]
+            callbacks.paint:set(function(event)
+                --renderer.line(x1: number, y1: number, x2: number, y2: number, r: number, g: number, b: number, a: number)
+                if (draw ~= 0) then
+                    local x, y = client.screen_size()
+                    x = x / 2
+                    y = y / 2
+                    --renderer.line(x + 92, y - 33, x - 92 , y - 47, 25, 25, 25, 255)
+                    --renderer.line(x + draw , y - 35, x - draw, y - 45, 255, 255, 255, 255)
+
+                    --renderer.rectangle(x: number, y: number, w: number, h: number, r: number, g: number, b: number, a: number)
+                    draw2i = math.lerp(draw2i, draw, 0.25)
+                    renderer.rectangle(x - ((draw2i + 5) / 2), y + (45 - (8 / 2)), (draw2i + 5), 8, 25, 25, 25, 255)
+                    renderer.rectangle(x - (draw2i / 2), y + (45 - (5 / 2)), draw2i, 5, 255, 255, 255, 155)
+                elseif (draw2 ~= 0) then
+                    local x, y = client.screen_size()
+                    x = x / 2
+                    y = y / 2
+                    --renderer.line(x + 92, y - 33, x - 92 , y - 47, 25, 25, 25, 255)
+                    --renderer.line(x + draw , y - 35, x - draw, y - 45, 255, 255, 255, 255)
+
+                    --renderer.rectangle(x: number, y: number, w: number, h: number, r: number, g: number, b: number, a: number)
+                    draw2i = math.lerp(draw2i, draw2, 0.25)
+                    renderer.rectangle(x - ((draw2i + 5) / 2), y + (45 - (8 / 2)), (draw2i + 5), 8, 25, 25, 25, 255)
+                    renderer.rectangle(x - (draw2i / 2), y + (45 - (5 / 2)), draw2i, 5, 255, 0, 255, 155)
+                end
+            end)
+            callbacks.aim_fire:set(function(event)
+                if ui.get(inertia.menu.ragebot.antiaim.onshot) == "Enabled" then
+                    ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                    ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), true)
+                    client.delay_call(1, function()
+                        ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                    end)
+                end
+            end)
+            local entityLabel = setmetatable({ent = 0},{__index = function(self, t) return function() return rawget(self, "ent") end end})
+            antiaim_event = callbacks.setup_command:set(function(event)
+                local target = client.current_threat()
+                local yaw_base = nil
+                local a, b = pcall(function ()
+                    rawset(entityLabel, "ent", target)
+                    local origin = vector(entity.get_prop(entityLabel, "m_vecOrigin"))
+                    if origin then
+                        local local_pos = vector(entity.get_prop(entity.get_local_player(), "m_vecOrigin"))
+                        local dist = origin:dist2d(local_pos)
+                        if (dist > 1000) then
+                            return
+                        end
+                        local _, yawBase, _ = (origin - local_pos):angles()
+                        yaw_base = yawBase
+                    end
+                end)
+                if (ui.get(inertia.menu.ragebot.antiaim.nasawalk) == "Enabled" and ui.get(inertia.menu.ragebot.antiaim.nasawalkbind)) then
+                    if (not ui.get(ui.reference("RAGE", "Aimbot", "Double tap"))) then
+                        event.allow_send_packet = false
+                    end
+                    tickSync = tickSync + 1
+                    if (tickSync > 0) then
+                        event.forwardmove = -event.forwardmove
+                        event.sidemove = -event.sidemove
+                        ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), true)
+                        if (tickSync > 2) then tickSync = -1 end
+                    elseif (tickSync == 0) then
+                        event.forwardmove = -event.forwardmove
+                        event.sidemove = -event.sidemove
+                        ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                    end
+                    event.pitch = 90
+                    event.yaw = math.random(-180,180)
+                    return
+                end
+                if (event.in_attack == 1 or event.in_use == 1 or event.in_attack2 == 1) then 
+                    grenadeFix = grenadeFix + 1
+                    event.allow_send_packet = false
+                    grenadeFix = math.clamp(grenadeFix, 0, 25)
+                return end
+                if (grenadeFix > 0) then grenadeFix = grenadeFix - 1 return end
+                if ui.get(inertia.menu.ragebot.antiaim.fakewalk) == "Enabled" then
+                    if (event.command_number % 7) > 4 then
+                        if (event.command_number) < 1 then
+                            event.forwardmove = -event.forwardmove / 100
+                            event.sidemove = -event.sidemove / 100
+                        else
+                            event.forwardmove = event.forwardmove / 25
+                            event.sidemove = event.sidemove / 25
+                        end
+                        event.allow_send_packet = false
+                    else
+                        event.forwardmove = 0
+                        event.sidemove = 0
+                    end
+                end
+                if ui.get(inertia.menu.ragebot.antiaim.yawmode) == "Static" then
+                    event.yaw = ui.get(inertia.menu.ragebot.antiaim.yaw_offset)
+                elseif ui.get(inertia.menu.ragebot.antiaim.yawmode) == "Jitter" then
+                    if (event.command_number % 5 > 3) then
+                        event.yaw = math.random(-ui.get(inertia.menu.ragebot.antiaim.yaw_jitter), ui.get(inertia.menu.ragebot.antiaim.yaw_jitter))
+                        event.pitch = 89
+                    end
+                elseif ui.get(inertia.menu.ragebot.antiaim.yawmode) == "Desync" then
+                    if (event.command_number % 5 > 3) then
+                        event.yaw = event.yaw + 180
+                        event.allow_send_packet = false
+                        event.pitch = 89
+                        if (event.command_number == 5) then
+                            event.yaw = event.yaw + 19e980
+                            event.allow_send_packet = false
+                            event.pitch = 89
+                        end
+                    else
+                        event.yaw = event.yaw + 90
+                    end
+                elseif ui.get(inertia.menu.ragebot.antiaim.yawmode) == "Delayed" then
+                    if (event.command_number % 50 == 0) then
+                        --cvar.net_fakeloss:set_float(25)
+                    else
+                        --cvar.net_fakeloss:set_float(0)
+                    end
+                    local target = client.current_threat()
+                    entity.set_prop(entity.get_local_player(), "m_angRotation", vector(event.yaw + 180 + 90, 0))
+                    local visible, pos
+                    local yeah = true 
+                    --[[if target then
+                        pos = vector(entity.get_prop(target, "m_vecOrigin")) + (vector(entity.get_prop(target, "m_vecVelocity")) * globals.tickinterval()*2)
+                        visible = isVisibleAnyBone(entity.hitbox_position(entity.get_local_player(), 0), pos)
+                        if visible then
+                            yeah = false
+                            event.yaw = event.yaw + 180 - 90
+                        else
+                            entity.set_prop(entity.get_local_player(), "m_angRotation", vector(event.yaw + 180 - 90, 0))
+                            pos = vector(entity.get_prop(target, "m_vecOrigin")) + (vector(entity.get_prop(target, "m_vecVelocity")) * globals.tickinterval()*2)
+                            visible = isVisibleAnyBone(entity.hitbox_position(entity.get_local_player(), 0), pos)
+                            if visible then
+                                yeah = false
+                                event.yaw = event.yaw + 180 + 90
+                            end
+                        end
+                    end]]
+                    if (yeah) then
+                        if yaw_base then
+                            if (event.command_number % jitter) == 0 then
+                                jitter =  math.random(2,4)
+                                yawori = -yawori
+                                --yawOffset = math.random(66,90) * yawori
+                                yawOffset = math.random(11,33) * yawori
+                                event.allow_send_packet = false
+                                --cvar.net_fakeloss:set_float(5)
+                            else
+                                --cvar.net_fakeloss:set_float(0)
+                            end
+                            yawOffset = yawOffset + math.random(-12,12)
+                            -- Math.round((mc.player.getYaw() + 1f) / 45f) * 45f;
+                            local yawLock = math.round((yaw_base + 1) / 45) * 45
+                            if (event.command_number % inverterticks) == inverterticks-1 then
+                                inverter = (math.random() > .5 and (45*math.random(-1,1)*math.random()) or 25)
+                                inverterticks = math.random(1,5)
+                            end
+                            event.yaw = yawLock - 180 + inverter + math.random(-25,25)
+                            event.allow_send_packet = math.random() > .5
+                            draw = event.yaw % 90
+                            draw2 = 0
+                            -- client.visible(x: number, y: number, z: number)
+                        else
+                            if (event.command_number % jitter) == 0 then
+                                jitter =  math.random(2,14)
+                                yawori = -yawori
+                                --yawOffset = math.random(66,90) * yawori
+                                yawOffset = math.random(22,55) * yawori
+                                event.allow_send_packet = false
+                                --cvar.net_fakeloss:set_float(5)
+                            else
+                                --cvar.net_fakeloss:set_float(0)
+                            end
+                            draw = 0
+                            yawOffset = yawOffset + math.random(-12,12)
+                            event.yaw = (yaw_base or event.yaw) + 180 + yawOffset
+                            draw2 = event.yaw % 90
+                        end
+                    end
+                end
+                if (event.in_jump == 1) and (ui.get(inertia.menu.ragebot.antiaim.defensive) == "On Land") and (entity.get_prop(entity.get_local_player(), "m_hGroundEntity")) then
+                    event.yaw = math.huge
+                    event.in_duck = true
+                    event.pitch = math.huge
+                    ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), true)
+                    client.delay_call(.07, function()
+                        ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                    end)
+                elseif (event.in_jump == 1) and (ui.get(inertia.menu.ragebot.antiaim.defensive) == "Air Jitter") and (not entity.get_prop(entity.get_local_player(), "m_hGroundEntity")) then
+                    if (event.command_number % 25) == 0 then
+                        ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), true)
+                        client.delay_call(math.max(math.random()/2,.1), function()
+                            ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                        end)
+                    end
+                elseif (event.in_jump == 1) and (ui.get(inertia.menu.ragebot.antiaim.defensive) == "Air") and (entity.get_prop(entity.get_local_player(), "m_hGroundEntity")) then
+                    if (defensive_timer <= 1) then
+                        ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), true)
+                        client.delay_call(0.25, function()
+                            ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                            defensive_timer = 0
+                            client.delay_call(0.1, function()
+                                ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), true)
+                                client.delay_call(0.265, function()
+                                    ui.set(ui.reference("RAGE", "Aimbot", "Double tap"), false)
+                                    defensive_timer = 0
+                                end)
+                            end)
+                        end)
+                    end
+                    defensive_timer = defensive_timer + 1
+                elseif ( (ui.get(inertia.menu.ragebot.antiaim.defensive) == "Desync") ) then
+                    if (event.command_number % random_drop) == 0 then
+                        event.allow_send_packet = false
+                        random_drop = math.random(1,3)
+                    end
+                end
+                if ui.get(inertia.menu.ragebot.antiaim.pitchmode) == "Down" then
+                    event.pitch = 89
+                elseif ui.get(inertia.menu.ragebot.antiaim.pitchmode) == "Emotion" then
+                    event.pitch = ((89 * 5) - 1) + .999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999986678979999
+                    -- Floating point fake pitch method
+                end
+                if ui.get(inertia.menu.ragebot.antiaim.lowerbodyyaw) == "Breaker" then
+                    local lby = entity.get_prop(entity.get_local_player(), "m_flLowerBodyYawTarget")
+                    if globals.tickcount() - last > 5 then
+                        event.yaw = 90
+                        if globals.tickcount() - last > 9 then
+                            last = globals.tickcount()
+                        end
+                        return
+                    end
+                    event.yaw = 180 - math.random(-45,45)
+                elseif ui.get(inertia.menu.ragebot.antiaim.lowerbodyyaw) == "Exploit" then
+                    timer = timer + 1
+                    entity.set_prop(entity.get_local_player(), "m_flLowerBodyYawTarget", (event.command_number % 100 < 77) and 180 - math.random(0,15) or 0)
+                elseif ui.get(inertia.menu.ragebot.antiaim.lowerbodyyaw) == "Ideal" then
+                    timer = timer + 1
+                    local currentYaw = event.yaw
+                    local bodyYaw = entity.get_prop(entity.get_local_player(), "m_flLowerBodyYawTarget")
+                    if (globals.curtime() - lby_timer > 1) then
+                        event.yaw = 180
+                        lby_timer = globals.curtime()
+                    else
+                        event.yaw = 90
+                    end
+                    entity.set_prop(entity.get_local_player(), "m_flLowerBodyYawTarget", 0/0)
+                else
+                    --entity.set_prop(entity.get_local_player(), "m_flLowerBodyYawTarget", 0)
+                end
+            end)
+        end
+        inertia.menu.ragebot.exploits_title = ui.new_label("LUA", "A", '\a'.. RGBToHex({85, 26, 159}).. 'ff\v•  \r'.. ColorShift("Exploits", {95, 36, 159}, {23, 23, 23}, 4))
+        inertia.menu.ragebot.visuals_title = ui.new_label("LUA", "A", '\a'.. RGBToHex({85, 26, 159}).. 'ff\v•   \r'.. ColorShift("Visuals", {95, 36, 159}, {24, 24, 24}, 3))
+        inertia.menu.ragebot.visuals_gradient_local_player = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Local Player", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 207, 159, 255, 255),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 93, 63, 211, 255),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_local_player
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Local player")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_fake_player = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Fake Local Player", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 207, 159, 255, 55),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 93, 63, 211, 111),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_fake_player
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Local player fake")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_weapon = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Weapon", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 207, 159, 255, 55),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 93, 63, 211, 111),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_weapon
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Weapon viewmodel")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_hands = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Hands", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 207, 159, 255, 55),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 93, 63, 211, 111),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_hands
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Hands")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_enemies_visible = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Enemies Visible", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 207, 159, 255, 255),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 93, 63, 211, 255),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_enemies_visible
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Player")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_enemies_invisible = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Enemies Invisible", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 95, 177, 225, 155),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 204, 204, 255, 100),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_enemies_invisible
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Player behind wall")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_glow = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Glow", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 95, 177, 225, 155),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 204, 204, 255, 100),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_glow
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Player ESP", "Glow")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+        inertia.menu.ragebot.visuals_gradient_shadow = {
+            title = ui.new_combobox("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Gradient Shadow", {111, 45, 170}, {9, 9, 9}, 5), "Disabled", "Enabled"),
+            colorfirst = ui.new_color_picker("LUA", "A", "Color 1", 95, 177, 225, 155),
+            colorsecond = ui.new_color_picker("LUA", "A", "Color 2", 204, 204, 255, 100),
+            rate = ui.new_slider("LUA", "A", '\a'.. RGBToHex({85+33, 26+33, 159+33}).. 'ff\v  •    \r'.. ColorShift("Speed", {111, 45, 170}, {9, 9, 9}, 5), 1, 100, 50, true, "", 1, {}),
+            splitter = ui.new_label("LUA", "A", "\a".. RGBToHex({85+33, 26+33, 159+33}).. "FF   ----------------------------------------")
+        } do
+            local array = inertia.menu.ragebot.visuals_gradient_enemies_invisible
+            local sine = 0
+            local updater
+            ui.set_callback(array.title, function(id)
+                if ui.get(id) == "Enabled" then
+                    local R, G, B, A = 0, 0, 0, 0
+                    updater = callbacks.paint:set(function(event)
+                        sine = sine + 1
+                        local RG, GG, BG, AG = ui.get(array.colorfirst)
+                        local RF, GF, BF, AF = ui.get(array.colorsecond)
+                        R = math.lerp(RG, RF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        R = math.lerp(RF, RG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        R = math.lerp(R, RG, .25)
+                        G = math.lerp(GG, GF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        G = math.lerp(GF, GG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        G = math.lerp(G, GG, .25)
+                        B = math.lerp(BG, BF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        B = math.lerp(BF, BG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        B = math.lerp(B, BG, .25)
+                        A = math.lerp(AG, AF, math.abs(math.sin(sine / ui.get(array.rate))))
+                        A = math.lerp(AF, AG, math.abs(math.cos(sine / ui.get(array.rate))))
+                        A = math.lerp(A, AG, .25)
+                        ui.set(ui.reference("VISUALS", "Colored models", "Shadow")+1, R, G, B, A)
+                    end)
+                else
+                    updater:unset()
+                end
+            end)
+        end
+    end
+    inertia.menu.misc = {}
+    do
+        inertia.menu.misc.title = ui.new_label("LUA", "B", "               \a551a8bFF inertia.lua | \aBB81FF0 misc")
+        inertia.menu.misc.title_secondary = ui.new_label("LUA", "B", inertia.dot.. "User Interface")
+    end
+
+    local db, data = database.read("main") or {}, {}
+    client.delay_call(1/2, function()
+        for keybase,array in next, inertia.menu.ragebot do
+            pcall(function()
+                for keyindex, main in next, array do
+                    pcall(function()
+                        local vars = db[keybase.. keyindex]
+                        ui.set(main, table.unpack(vars))
+                    end)
+                end
+            end)
+        end
+    end)
+    local applyConfig;
+    function applyConfig()
+        for keybase,array in next, inertia.menu.ragebot do
+            pcall(function ()
+                for keyindex, main in next, array do
+                    pcall(function()
+                        local vars = {ui.get(main)}
+                        data[keybase.. keyindex] = {ui.get(main)}
+                    end)
+                end
+            end)
+        end
+        client.delay_call(1, applyConfig)
+        database.write("main", data)
+    end
+    client.delay_call(1, applyConfig)
+end
